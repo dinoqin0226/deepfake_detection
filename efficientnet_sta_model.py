@@ -1,59 +1,63 @@
 import tensorflow as tf
 from tensorflow.keras import layers, Model
-from efficientnet_b4_model import build_efficientnet_b4
-from sta_lite import sta_lite_block
+from backbone.efficientnet_b4 import build_efficientnet_b4_backbone
+from modules.sta_lite import StALiteModule
+from config import CONFIG
 
-def build_spatiotemporal_model(input_shape=(224, 224, 3), num_frames=5, num_classes=1):
+def build_efficientnet_sta_model(input_shape=(CONFIG.FRAMES_PER_VIDEO, *CONFIG.IMG_SIZE, 3), num_classes=2):
     """
-    Build integrated model: EfficientNet-B4 + StA-Lite
-    Args:
-        input_shape: Single frame shape (224, 224, 3)
-        num_frames: Number of frames in sequence (default=5)
-        num_classes: Output classes (1 for binary classification)
-    Returns:
-        Integrated spatiotemporal detection model
+    构建EfficientNet+StA-Lite基础模型（历史版本）
+    :param input_shape: 输入形状 (frames, H, W, C)
+    :param num_classes: 分类数
+    :return: 模型
     """
-    # Step 1: Build EfficientNet-B4 (freeze bottom layers for feature extraction)
-    effnet = build_efficientnet_b4(input_shape=input_shape, num_classes=num_classes)
-    effnet.trainable = True  # Unfreeze for joint training
-    single_frame_input = effnet.input
+    # 输入层
+    inputs = layers.Input(shape=input_shape)
     
-    # Step 2: Extract single-frame features
-    single_frame_features = effnet.layers[-3].output  # Output before dropout (shape: (batch, 128))
-    single_frame_features = layers.Reshape((1, 1, 1, 128))(single_frame_features)  # (batch, 1, 1, 1, 128)
+    # 展开帧维度
+    batch_size = tf.shape(inputs)[0]
+    frames_flat = layers.Reshape((-1, *CONFIG.IMG_SIZE, 3))(inputs)
     
-    # Step 3: Adapt to frame sequence (for image input: repeat to pseudo-sequence; for video: direct input)
-    def process_sequence(input_tensor):
-        if len(input_tensor.shape) == 4:  # Single image input (batch, 224, 224, 3)
-            frame_features = tf.keras.backend.repeat_elements(single_frame_features, num_frames, axis=1)
-        else:  # Video sequence input (batch, num_frames, 224, 224, 3)
-            frame_features = []
-            for i in range(num_frames):
-                frame = input_tensor[:, i, :, :, :]
-                feat = effnet(frame)
-                frame_features.append(layers.Reshape((1, 1, 1, 128))(feat))
-            frame_features = layers.Concatenate(axis=1)(frame_features)  # (batch, num_frames, 1, 1, 128)
-        return frame_features
+    # EfficientNet-B4特征提取
+    backbone = build_efficientnet_b4_backbone(
+        input_shape=(*CONFIG.IMG_SIZE, 3),
+        weights="imagenet",
+        include_top=False
+    )
+    frame_features = backbone(frames_flat)
+    frame_features = layers.GlobalAveragePooling2D()(frame_features)
     
-    # Step 4: StA-Lite for spatiotemporal fusion
-    sequence_input = layers.Input(shape=(num_frames, 224, 224, 3)) if num_frames > 1 else single_frame_input
-    if num_frames > 1:
-        frame_features = process_sequence(sequence_input)
-        fused_features = sta_lite_block(frame_features, num_frames=num_frames)
-        # Global pooling across frames
-        pooled_features = layers.GlobalAveragePooling3D()(fused_features)
-    else:
-        pooled_features = single_frame_features
+    # 恢复时间维度
+    feature_dim = frame_features.shape[-1]
+    video_features = layers.Reshape((CONFIG.FRAMES_PER_VIDEO, feature_dim))(frame_features)
     
-    # Step 5: Classification layer
-    dropout = layers.Dropout(0.3)(pooled_features)
-    outputs = layers.Dense(num_classes, activation='sigmoid', name='confidence_score')(dropout)
+    # StA-Lite时空融合
+    sta_lite = StALiteModule(
+        hidden_dim=CONFIG.STA_LITE_CONFIG["hidden_dim"],
+        num_heads=CONFIG.STA_LITE_CONFIG["num_heads"],
+        gru_units=CONFIG.STA_LITE_CONFIG["gru_units"]
+    )
+    fused_features = sta_lite(video_features)
     
-    # Build model
-    model = Model(inputs=sequence_input, outputs=outputs, name='EfficientNet-B4-StA-Lite')
+    # 分类头
+    x = layers.Dropout(0.2)(fused_features)
+    x = layers.Dense(256, activation="swish")(x)
+    x = layers.Dropout(0.3)(x)
+    outputs = layers.Dense(num_classes, activation="softmax")(x)
+    
+    # 构建模型
+    model = Model(inputs=inputs, outputs=outputs, name="EfficientNet_STA_Model")
+    
+    # 编译模型
+    model.compile(
+        optimizer=tf.keras.optimizers.AdamW(learning_rate=1e-4),
+        loss=tf.keras.losses.CategoricalCrossentropy(),
+        metrics=["accuracy"]
+    )
+    
     return model
 
-# Test model construction
+# 测试模型构建
 if __name__ == "__main__":
-    model = build_spatiotemporal_model(num_frames=5)
-    model.summary()  # Verify total parameters ≤21M
+    model = build_efficientnet_sta_model()
+    model.summary()
